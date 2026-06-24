@@ -2,9 +2,10 @@
 import numpy as np
 
 import app
-from app import (rms_level, select_segments, build_ffmpeg_cmd,
-                 list_input_mics, list_dshow_audio, list_monitors, set_dpi_aware,
-                 PRE, POST, SEG_LEN)
+from app import (rms_level, select_segments, select_range, build_ffmpeg_cmd,
+                 estimate_footprint, list_input_mics, list_dshow_audio,
+                 list_monitors, set_dpi_aware,
+                 PRE, POST, SEG_LEN, MAX_EXTEND)
 
 
 def test_level_detector():
@@ -55,6 +56,29 @@ def test_select_empty():
     assert select_segments([], 1000.0) == []
 
 
+def test_select_range_merged_window():
+    # 1s segments across a wide span
+    segs = [("seg_%d.ts" % s, float(s)) for s in range(0, 200)]
+    # a single peak at T == the usual PRE+POST window
+    T = 100.0
+    single = select_range(segs, T - PRE, T + POST)
+    s_starts = [s for n, s in segs if n in single]
+    assert min(s_starts) <= T - PRE and max(s_starts) >= T + POST - SEG_LEN
+    # back-to-back peaks: first at T, last at T+10 -> one window covering both,
+    # strictly longer than a single-peak clip (this is the #4 fix).
+    first, last = T, T + 10.0
+    merged = select_range(segs, first - PRE, last + POST)
+    m_starts = [s for n, s in segs if n in merged]
+    assert min(m_starts) <= first - PRE
+    assert max(m_starts) >= last + POST - SEG_LEN
+    assert (max(m_starts) - min(m_starts)) > (max(s_starts) - min(s_starts))
+    # the extension is capped: clip never exceeds PRE + MAX_EXTEND + POST seconds
+    capped_last = first + MAX_EXTEND
+    capped = select_range(segs, first - PRE, capped_last + POST)
+    c_starts = [s for n, s in segs if n in capped]
+    assert (max(c_starts) - min(c_starts)) <= (PRE + MAX_EXTEND + POST + SEG_LEN)
+
+
 def test_build_ffmpeg_cmd():
     # 0 sources: video only, no amix
     c0 = build_ffmpeg_cmd([])
@@ -76,6 +100,33 @@ def test_build_ffmpeg_cmd():
     assert "-offset_x 100" in jr and "-offset_y 200" in jr and "1920x1080" in jr
 
 
+def test_build_ffmpeg_scale():
+    # native = no scale filter
+    assert "scale=" not in " ".join(build_ffmpeg_cmd([]))
+    # scaled, no audio: video goes through filter_complex, mapped [v]
+    j = " ".join(build_ffmpeg_cmd([], scale_h=720))
+    assert "scale=-2:720" in j and "-map [v]" in j
+    # scale + 2 audio: one filtergraph holds BOTH the scale and the amix
+    j2 = " ".join(build_ffmpeg_cmd(["A", "B"], scale_h=480))
+    assert "scale=-2:480[v]" in j2 and "amix=inputs=2" in j2
+    assert "-map [v]" in j2 and "-map [a]" in j2
+    assert j2.count("-filter_complex") == 1     # combined, not two graphs
+    # buffer dir is honored in the segment output path
+    assert "ramdisk" in " ".join(build_ffmpeg_cmd([], bufdir="ramdisk"))
+
+
+def test_estimate_footprint():
+    e = estimate_footprint(1920, 1080, 30, buffer_secs=60, clip_secs=30)
+    # bitrate scales with pixels*fps*BPP; sanity-check order of magnitude
+    assert 3 < e["mbps"] < 12
+    # buffer holds 60s, clip holds 30s -> buffer is ~2x the clip
+    assert abs(e["buffer_mb"] / e["clip_mb"] - 2.0) < 0.01
+    # half the resolution -> ~quarter the bitrate
+    half = estimate_footprint(960, 540, 30, 60, 30)
+    assert abs(half["mbps"] / e["mbps"] - 0.25) < 0.01
+    assert e["ram_mb"] > 150
+
+
 def test_device_enumeration():
     # Don't assert non-empty (machine-dependent); just that they return lists
     # of the expected shape without throwing.
@@ -94,6 +145,9 @@ if __name__ == "__main__":
     test_settings_roundtrip()
     test_select_segments()
     test_select_empty()
+    test_select_range_merged_window()
     test_build_ffmpeg_cmd()
+    test_build_ffmpeg_scale()
+    test_estimate_footprint()
     test_device_enumeration()
     print("ok")

@@ -61,8 +61,7 @@ Capture only a specific app's audio (e.g. just Discord, not the whole desktop).
 
 ## Pain points found in code scan (bugs, not features)
 
-Ordered by how much they hurt. **#1, #2, #3, #5, #6, #7 are now fixed**; #4 is a
-design trade-off left open (see below).
+Ordered by how much they hurt. **All seven are now fixed.**
 
 1. **ffmpeg-missing crashes at startup.**  ✅ DONE — [main](app.py) checks
    `shutil.which("ffmpeg")` and shows a friendly messagebox (or prints, if Tk is
@@ -78,11 +77,12 @@ design trade-off left open (see below).
    [rms_level](app.py) (RMS of the block). Default `--threshold` dropped to 0.1
    to match the new scale. A single 0.9 click now reads <0.05.
 
-4. **Back-to-back moments are dropped.** [_do_clip](app.py) holds `_armed=False`
-   for `POST+1`s plus a 1s cooldown (~17s); any second peak in that window is
-   lost. Left as-is: it's inherent to fixed-window non-overlapping clips, and
-   merging/extending the in-flight clip is a real feature, not a one-liner.
-   Revisit if missed back-to-back moments actually bite.
+4. **Back-to-back moments are dropped.**  ✅ DONE — a peak during capture now
+   pushes the clip's end out (via `_last_peak`, capped at `MAX_EXTEND=20s`) so a
+   burst of loud moments becomes one continuous clip instead of being lost in the
+   post-roll window. Window selection generalized to
+   [select_range](app.py) (`first_peak-PRE .. last_peak+POST`); the cap keeps the
+   longest clip (`PRE+MAX_EXTEND+POST = 50s`) inside the 60s buffer.
 
 5. **stop() freezes the UI.**  ✅ DONE — the Stop button runs teardown on a
    worker thread and re-enables controls via `root.after`; window-close stays
@@ -105,3 +105,57 @@ design trade-off left open (see below).
   `silencedetect`/`ametadata` ([app.py:start](app.py#L181) ponytail note).
 - **Monitor selection**: ✅ DONE — GUI has a monitor picker (defaults to the
   primary monitor) that crops gdigrab via `-offset_x/-offset_y/-video_size`.
+
+## Roadmap — improvements from later scans (not bugs)
+
+Ranked by value-for-effort. None of these are defects; they're enhancements
+found while reviewing the working code.
+
+1. **"Clip now" manual trigger.** The most common miss for an instant-replay
+   tool is a great moment you *didn't* shout at. A GUI button (or hotkey) that
+   fires `_do_clip` on demand captures the last ~15s regardless of loudness.
+   Cheap: reuses existing machinery, ~5 lines in [run_gui](app.py). A global
+   hotkey (Windows `RegisterHotKey` via ctypes) is the bigger version; the
+   button is the lazy 80%.
+2. **Auto-recover from "RECORDER DIED".** When ffmpeg dies, [tick](app.py) shows
+   red but Start stays disabled and the trigger mic stays open — stuck until a
+   manual Stop→Start. Fix: in `tick`, if `state == "error"`, call the GUI
+   `stop()` once to tear down the dead clipper and re-enable Start. ~3 lines.
+3. **Clamp the meter bar.** [draw_meter](app.py) does `int(level * MW)`; a driver
+   returning level > 1.0 overflows the canvas. `min(level, 1.0)`.
+4. **argparse description** still says "Peak-triggered" — it's RMS now (cosmetic).
+5. **Threshold auto-calibration** (bigger): measure ambient RMS for a second on
+   start and set the default threshold above it, so a new user isn't guessing.
+   Test mode already covers manual tuning, so this is a nice-to-have.
+
+Deliberately NOT planned (over-engineering for this tool): refactoring the
+~180-line `run_gui` (works, no bug), pinning `requirements.txt` (personal tool;
+wrong pins are worse than none), clips-folder retention (clips are the output —
+accumulating is correct).
+
+## Shipped — capture settings + stats + RAM buffer
+
+Added as GUI settings (all persisted to `loudred_settings.json`):
+
+- **Capture resolution** — Native / 1080p / 720p / 480p, via `scale_h` in
+  [build_ffmpeg_cmd](app.py) (`scale=-2:H` folded into the filtergraph alongside
+  any `amix`).
+- **Clip window** — seconds before/after are now `Clipper(pre=, post=)`; buffer
+  retention derives from them (`pre + post + MAX_EXTEND + 10`). `build_clip` /
+  `prune_loop` take the window/retention as params.
+- **Stats for nerds** — [estimate_footprint](app.py) gives bitrate, rolling-buffer
+  MB, per-clip MB and rough ffmpeg RAM from resolution × fps × `BITS_PER_PIXEL`;
+  a GUI toggle shows it live as you change settings.
+- **Buffer folder** — `Clipper(bufdir=)` makes the rolling-buffer location
+  configurable, so it can point at a RAM disk to avoid SSD write wear. README has
+  the ImDisk/OSFMount setup.
+
+### Still open: zero-dependency in-RAM ring buffer
+The buffer-folder approach needs the user to create a RAM disk (one external
+tool). A driver-free alternative: have ffmpeg emit MPEG-TS to `pipe:1` with a
+forced ~1s keyframe interval, keep the last N seconds of TS bytes in a Python
+deque (a pure, testable ring buffer), and on trigger write the slice to `.ts` and
+remux to mp4. **Caveat:** cutting/concatenating a live TS stream (packet + GOP
+alignment, A/V sync, start-PTS) is fragile and can't be validated without real
+ffmpeg + playback, so it's deferred rather than shipped half-working. The RAM-disk
+path is the robust version today.

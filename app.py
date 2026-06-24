@@ -1,8 +1,9 @@
-"""Loudred - peak-triggered screen+audio clipper (instant replay).
+"""Loudred - loudness-triggered screen+audio clipper (instant replay).
 
 Continuously buffers screen video + desktop/Discord audio (loopback) + mic into
-1s segments. When the mic crosses a loudness threshold, saves the 30s window
-(15s before + 15s after) as one mp4.
+1s segments. When the mic's RMS loudness crosses a threshold, saves the window
+(15s before + 15s after) as one mp4; if loudness keeps coming the clip extends
+to keep covering it (up to MAX_EXTEND).
 
 Needs ffmpeg on PATH. See README.md.
 """
@@ -25,9 +26,14 @@ SEG_LEN = 1                  # seconds per segment
 PRE = 15                     # seconds before the peak
 POST = 15                    # seconds after the peak
 RETENTION = 60              # keep this many seconds of buffer on disk
+MAX_EXTEND = 20             # if peaks keep coming, grow a clip's end by up to this
+                            # many seconds (back-to-back moments -> one clip).
+                            # ponytail: ceiling is RETENTION-PRE-POST-SEG_LEN (~29s);
+                            # raise RETENTION before raising this.
 FPS = 30
 BUFDIR = "buffer"
 CLIPDIR = "clips"
+QUALITY_PRESETS = {"Native": None, "1080p": 1080, "720p": 720, "480p": 480}
 SEG_GLOB = "seg_*.ts"
 SEG_FMT = "seg_%Y%m%d_%H%M%S.ts"
 LOOPBACK_HINTS = ("stereo mix", "cable output", "loopback", "what u hear",
@@ -74,14 +80,18 @@ def parse_seg_time(name):
     return datetime.strptime(base, SEG_FMT).timestamp()
 
 
-def select_segments(segs, trigger, pre=PRE, post=POST, seg_len=SEG_LEN):
-    """Pick segments overlapping [trigger-pre, trigger+post].
+def select_range(segs, lo, hi, seg_len=SEG_LEN):
+    """Pick segments overlapping the epoch-second window [lo, hi].
 
     segs: list of (name, start_epoch). Returns names sorted by start time.
     """
-    lo, hi = trigger - pre, trigger + post
     chosen = [(s, n) for n, s in segs if s + seg_len >= lo and s <= hi]
     return [n for _, n in sorted(chosen)]
+
+
+def select_segments(segs, trigger, pre=PRE, post=POST, seg_len=SEG_LEN):
+    """Segments overlapping [trigger-pre, trigger+post] (single-peak window)."""
+    return select_range(segs, trigger - pre, trigger + post, seg_len)
 
 
 # ---- device discovery ----
@@ -103,9 +113,11 @@ def list_dshow_audio():
     return names
 
 
-def pick_devices(mic_override=None, loop_override=None):
-    """Return (mic_name, loopback_name_or_None)."""
-    names = list_dshow_audio()
+def pick_devices(mic_override=None, loop_override=None, names=None):
+    """Return (mic_name, loopback_name_or_None). Pass `names` to reuse an
+    already-fetched device list and avoid a second ffmpeg launch."""
+    if names is None:
+        names = list_dshow_audio()
     loop = loop_override or next(
         (n for n in names if any(h in n.lower() for h in LOOPBACK_HINTS)), None)
     mic = mic_override or next((n for n in names if n != loop), None)
@@ -155,10 +167,14 @@ def list_monitors():
 
 # ---- continuous recorder + pruner ----
 
-def build_ffmpeg_cmd(audio_devices, region=None):
+def build_ffmpeg_cmd(audio_devices, region=None, scale_h=None, bufdir=BUFDIR):
     """ffmpeg cmd: screen video + any number of dshow audio sources mixed to one track.
 
-    region = (x, y, w, h) crops gdigrab to one monitor; None = whole virtual desktop.
+    region   = (x, y, w, h) crops gdigrab to one monitor; None = whole virtual desktop.
+    scale_h  = downscale video to this many lines (keeps aspect, even width);
+               None = capture at native resolution.
+    bufdir   = directory the 1s segments are written to (point at a RAM disk to
+               avoid SSD write wear).
     """
     cmd = ["ffmpeg", "-hide_banner", "-y", "-f", "gdigrab", "-framerate", str(FPS)]
     if region:
@@ -168,35 +184,69 @@ def build_ffmpeg_cmd(audio_devices, region=None):
     for d in audio_devices:
         cmd += ["-f", "dshow", "-i", "audio=" + d]
     n = len(audio_devices)
-    if n == 0:
-        cmd += ["-map", "0:v"]
-    elif n == 1:
-        cmd += ["-map", "0:v", "-map", "1:a"]
+
+    # Build one filtergraph for whatever needs filtering (video scale, audio mix);
+    # map everything else straight through. -vf can't coexist with -filter_complex,
+    # so scaling goes through filter_complex too.
+    chains, maps = [], []
+    if scale_h:
+        chains.append("[0:v]scale=-2:%d[v]" % scale_h)
+        maps += ["-map", "[v]"]
     else:
+        maps += ["-map", "0:v"]
+    if n == 1:
+        maps += ["-map", "1:a"]
+    elif n >= 2:
         ins = "".join("[%d:a]" % (i + 1) for i in range(n))
-        cmd += ["-filter_complex", "%samix=inputs=%d:duration=longest[a]" % (ins, n),
-                "-map", "0:v", "-map", "[a]"]
+        chains.append("%samix=inputs=%d:duration=longest[a]" % (ins, n))
+        maps += ["-map", "[a]"]
+    if chains:
+        cmd += ["-filter_complex", ";".join(chains)]
+    cmd += maps
     cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
             "-c:a", "aac",
             "-f", "segment", "-segment_time", str(SEG_LEN),
             "-reset_timestamps", "1", "-strftime", "1",
-            os.path.join(BUFDIR, SEG_FMT)]
+            os.path.join(bufdir, SEG_FMT)]
     return cmd
 
 
-def prune_loop(stop):
-    """Delete buffer segments (and stale concat lists) older than RETENTION."""
+# Rough H.264-ultrafast bits per pixel per frame. Content-dependent (motion,
+# detail), so footprint estimates are an order-of-magnitude guide, not a promise.
+BITS_PER_PIXEL = 0.10
+
+
+def estimate_footprint(width, height, fps, buffer_secs, clip_secs):
+    """Rough resource estimate for capturing WxH@fps. Returns a dict of:
+      mbps      - encoded video bitrate (Mbit/s)
+      buffer_mb - rolling buffer on DISK (buffer_secs of video)
+      clip_mb   - one saved clip on disk (clip_secs of video)
+      ram_mb    - rough ffmpeg+python working set (mostly resolution-independent)
+    The buffer is on disk, not RAM - that's the number that grows with resolution.
+    """
+    bps = width * height * fps * BITS_PER_PIXEL          # bits/sec
+    raw_frame_mb = width * height * 1.5 / 1e6            # yuv420 bytes/frame
+    return {
+        "mbps": bps / 1e6,
+        "buffer_mb": bps * buffer_secs / 8 / 1e6,
+        "clip_mb": bps * clip_secs / 8 / 1e6,
+        "ram_mb": 150 + raw_frame_mb * 8,               # ~base + a few frames in flight
+    }
+
+
+def prune_loop(stop, retention=RETENTION, bufdir=BUFDIR):
+    """Delete buffer segments (and stale concat lists) older than `retention` secs."""
     while not stop.is_set():
-        cutoff = time.time() - RETENTION
-        for f in glob.glob(os.path.join(BUFDIR, SEG_GLOB)):
+        cutoff = time.time() - retention
+        for f in glob.glob(os.path.join(bufdir, SEG_GLOB)):
             try:
                 if parse_seg_time(f) < cutoff:
                     os.remove(f)
             except (ValueError, OSError):
                 pass
-        # concat_*.txt lives <POST+1s during a clip; anything older is orphaned
+        # concat_*.txt lives <post+1s during a clip; anything older is orphaned
         # by a crash between write and remove in build_clip.
-        for f in glob.glob(os.path.join(BUFDIR, "concat_*.txt")):
+        for f in glob.glob(os.path.join(bufdir, "concat_*.txt")):
             try:
                 if os.path.getmtime(f) < cutoff:
                     os.remove(f)
@@ -205,25 +255,30 @@ def prune_loop(stop):
         stop.wait(5)
 
 
-def build_clip(trigger, log, clipdir=CLIPDIR):
-    """Concat the segments around `trigger` into one mp4. Lossless copy."""
+def build_clip(first_peak, last_peak, log, clipdir=CLIPDIR, pre=PRE, post=POST, bufdir=BUFDIR):
+    """Concat the buffered segments around a loud moment into one mp4.
+
+    Window = [first_peak-pre, last_peak+post]. With no extra peaks
+    last_peak == first_peak (the usual pre+post seconds); when loudness kept
+    coming the window stretches to cover it all. Lossless stream copy.
+    """
     segs = []
-    for f in glob.glob(os.path.join(BUFDIR, SEG_GLOB)):
+    for f in glob.glob(os.path.join(bufdir, SEG_GLOB)):
         try:
             segs.append((f, parse_seg_time(f)))
         except ValueError:
             pass
-    chosen = select_segments([(f, t) for f, t in segs], trigger)
+    chosen = select_range([(f, t) for f, t in segs], first_peak - pre, last_peak + post)
     if not chosen:
         log("No segments to clip (buffer empty?)")
         return None
-    listfile = os.path.join(BUFDIR, "concat_%d.txt" % int(trigger))
+    listfile = os.path.join(bufdir, "concat_%d.txt" % int(first_peak))
     with open(listfile, "w") as fh:
         for n in chosen:
             fh.write("file '%s'\n" % os.path.abspath(n).replace("\\", "/"))
     os.makedirs(clipdir, exist_ok=True)
     out = os.path.join(clipdir,
-                       "clip_%s.mp4" % datetime.fromtimestamp(trigger).strftime("%Y%m%d_%H%M%S"))
+                       "clip_%s.mp4" % datetime.fromtimestamp(first_peak).strftime("%Y%m%d_%H%M%S"))
     r = subprocess.run(
         ["ffmpeg", "-hide_banner", "-y", "-f", "concat", "-safe", "0",
          "-i", listfile, "-c", "copy", out],
@@ -233,7 +288,8 @@ def build_clip(trigger, log, clipdir=CLIPDIR):
     except OSError:
         pass
     if r.returncode != 0:
-        log("Clip failed: " + r.stderr.strip().splitlines()[-1:] [0] if r.stderr else "ffmpeg error")
+        tail = r.stderr.strip().splitlines() if r.stderr else []
+        log("Clip failed: " + (tail[-1] if tail else "ffmpeg error"))
         return None
     log("Saved " + out)
     return out
@@ -243,15 +299,22 @@ class Clipper:
     """Owns the ffmpeg recorder, pruner, mic-trigger and clip building."""
 
     def __init__(self, threshold, audio_devices, trigger_mic=None, on_event=print,
-                 clipdir=CLIPDIR, test_mode=False, region=None):
+                 clipdir=CLIPDIR, test_mode=False, region=None,
+                 pre=PRE, post=POST, scale_h=None, bufdir=BUFDIR):
         self.threshold = threshold
         self.audio_devices = list(audio_devices)   # dshow names recorded into the clip
         self.trigger_mic = trigger_mic             # sounddevice index/name; None = default
         self.region = region                       # (x,y,w,h) monitor crop; None = all
+        self.pre = pre                             # seconds kept before a peak
+        self.post = post                           # seconds kept after a peak
+        self.scale_h = scale_h                     # downscale height; None = native
+        self.bufdir = bufdir                       # where 1s segments live (RAM disk = no SSD wear)
+        # buffer must outlast the longest possible clip (window + extension + margin)
+        self.retention = pre + post + MAX_EXTEND + 10
         self.on_event = on_event
         self.clipdir = clipdir
         self.test_mode = test_mode
-        self.level = 0.0           # latest mic peak, for the GUI meter
+        self.level = 0.0           # latest mic RMS loudness, for the GUI meter
         self.clip_count = 0
         self.state = "idle"        # idle | armed | capturing | cooldown | error
         self._proc = None
@@ -259,17 +322,22 @@ class Clipper:
         self._stop = threading.Event()
         self._stream = None
         self._armed = True
+        self._first_peak = 0.0     # window anchors for the in-flight clip
+        self._last_peak = 0.0      # pushed out by later peaks (capped at MAX_EXTEND)
         self._lock = threading.Lock()
 
     def start(self):
-        os.makedirs(BUFDIR, exist_ok=True)
+        os.makedirs(self.bufdir, exist_ok=True)
         os.makedirs(self.clipdir, exist_ok=True)
         if not self.audio_devices:
             self.on_event("WARNING: no audio sources selected - clips will be video-only.")
         vid = ("monitor %dx%d at (%d,%d)" % (self.region[2], self.region[3],
                self.region[0], self.region[1])) if self.region else "ALL monitors (whole desktop)"
+        if self.scale_h:
+            vid += " -> scaled to %dp" % self.scale_h
         self.on_event("Video: " + vid)
         self.on_event("Recording sources: " + (", ".join(self.audio_devices) or "NONE"))
+        self.on_event("Buffer: %s (%ds rolling)" % (os.path.abspath(self.bufdir), self.retention))
         self._stop.clear()
         # ponytail: mic opened twice (ffmpeg records, sounddevice triggers).
         # Windows shared-mode allows this; if it ever fails, parse ffmpeg
@@ -281,15 +349,17 @@ class Clipper:
         except Exception as e:
             self.on_event("Trigger mic failed to open: %s" % e)
             return False
-        self._errlog = open(os.path.join(BUFDIR, "ffmpeg.log"), "w")
-        self._proc = subprocess.Popen(build_ffmpeg_cmd(self.audio_devices, self.region),
-                                      stdin=subprocess.PIPE,
-                                      stdout=subprocess.DEVNULL, stderr=self._errlog)
-        threading.Thread(target=prune_loop, args=(self._stop,), daemon=True).start()
+        self._errlog = open(os.path.join(self.bufdir, "ffmpeg.log"), "w")
+        self._proc = subprocess.Popen(
+            build_ffmpeg_cmd(self.audio_devices, self.region, self.scale_h, self.bufdir),
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=self._errlog)
+        threading.Thread(target=prune_loop,
+                         args=(self._stop, self.retention, self.bufdir), daemon=True).start()
         threading.Thread(target=self._watch_proc, daemon=True).start()
         self.state = "armed"
         self.on_event("Recording. Buffering %ds; clips = %ds before + %ds after a peak.%s"
-                      % (RETENTION, PRE, POST, "  [TEST MODE - no clips]" if self.test_mode else ""))
+                      % (self.retention, self.pre, self.post,
+                         "  [TEST MODE - no clips]" if self.test_mode else ""))
         return True
 
     def _watch_proc(self):
@@ -302,7 +372,7 @@ class Clipper:
         if not self._stop.is_set():
             self.state = "error"
             self.on_event("Recorder (ffmpeg) stopped unexpectedly (exit %s). See %s"
-                          % (code, os.path.join(BUFDIR, "ffmpeg.log")))
+                          % (code, os.path.join(self.bufdir, "ffmpeg.log")))
 
     def _on_audio(self, indata, frames, t, status):
         lvl = rms_level(indata[:, 0])
@@ -310,17 +380,35 @@ class Clipper:
         if self.test_mode:
             return
         if lvl >= self.threshold:
+            now = time.time()
             with self._lock:
                 if self._armed:
                     self._armed = False
                     self.state = "capturing"
-                    trig = time.time()
-                    threading.Thread(target=self._do_clip, args=(trig,), daemon=True).start()
+                    self._first_peak = self._last_peak = now
+                    threading.Thread(target=self._do_clip, daemon=True).start()
+                elif self.state == "capturing":
+                    # still loud mid-capture: push the clip's end out (capped) so
+                    # back-to-back moments land in one clip instead of being dropped.
+                    self._last_peak = min(now, self._first_peak + MAX_EXTEND)
 
-    def _do_clip(self, trig):
+    def _do_clip(self):
         self.on_event("Peak! Capturing window...")
-        time.sleep(POST + 1)            # let post-roll land on disk
-        out = build_clip(trig, self.on_event, self.clipdir)
+        # Wait until POST seconds past the LAST peak. _on_audio keeps pushing
+        # _last_peak out (up to MAX_EXTEND) while loudness continues, so a burst
+        # of moments extends one clip instead of being dropped during capture.
+        while True:
+            with self._lock:
+                deadline = self._last_peak + self.post + 1
+            if time.time() >= deadline:
+                break
+            time.sleep(0.25)
+        with self._lock:
+            first, last = self._first_peak, self._last_peak
+        if last > first:
+            self.on_event("Loud streak: extended clip to %ds." % int(last - first + self.pre + self.post))
+        out = build_clip(first, last, self.on_event, self.clipdir,
+                         self.pre, self.post, self.bufdir)
         if out:
             self.clip_count += 1
         self.state = "cooldown"
@@ -356,7 +444,7 @@ def run_gui(args):
 
     root = tk.Tk()
     root.title("Loudred - instant replay clipper")
-    root.geometry("520x680")
+    root.geometry("560x860")
 
     # red "record" dot as the window/taskbar icon (no file, no extra dependency)
     icon = tk.PhotoImage(width=64, height=64)
@@ -397,6 +485,43 @@ def run_gui(args):
     mon_cb.current(saved_mon if 0 <= saved_mon < len(mon_opts)
                    else (default_mon if mon_opts else 0))
     mon_cb.pack(fill="x", padx=10)
+    mon_cb.bind("<<ComboboxSelected>>", lambda e: _update_stats())
+
+    # --- capture quality (downscale to spare CPU + buffer size) ---
+    ttk.Label(root, text="Capture quality:").pack(anchor="w", padx=10, pady=(8, 0))
+    quality_cb = ttk.Combobox(root, state="readonly", values=list(QUALITY_PRESETS))
+    quality_cb.set(cfg.get("quality") if cfg.get("quality") in QUALITY_PRESETS else "Native")
+    quality_cb.pack(fill="x", padx=10)
+    quality_cb.bind("<<ComboboxSelected>>", lambda e: _update_stats())
+
+    # --- clip window (seconds before / after the peak) ---
+    win = ttk.Frame(root); win.pack(fill="x", padx=10, pady=(8, 0))
+    ttk.Label(win, text="Clip window  -  seconds before:").pack(side="left")
+    pre_var = tk.IntVar(value=int(cfg.get("pre", PRE)))
+    pre_spin = ttk.Spinbox(win, from_=1, to=120, width=4, textvariable=pre_var,
+                           command=lambda: _update_stats())
+    pre_spin.pack(side="left", padx=(4, 10))
+    ttk.Label(win, text="after:").pack(side="left")
+    post_var = tk.IntVar(value=int(cfg.get("post", POST)))
+    post_spin = ttk.Spinbox(win, from_=1, to=120, width=4, textvariable=post_var,
+                            command=lambda: _update_stats())
+    post_spin.pack(side="left", padx=4)
+
+    # --- buffer location (a RAM-disk path spares SSD write cycles) ---
+    ttk.Label(root, text="Buffer folder (point at a RAM disk to spare your SSD):"
+              ).pack(anchor="w", padx=10, pady=(8, 0))
+    buf_var = tk.StringVar(value=cfg.get("bufdir", BUFDIR))
+    buf_entry = ttk.Entry(root, textvariable=buf_var)
+    buf_entry.pack(fill="x", padx=10)
+    buf_var.trace_add("write", lambda *a: _update_stats())
+
+    # --- stats for nerds ---
+    stats_var = tk.BooleanVar(value=bool(cfg.get("stats", False)))
+    ttk.Checkbutton(root, text="Stats for nerds (estimate buffer / clip footprint)",
+                    variable=stats_var,
+                    command=lambda: _update_stats()).pack(anchor="w", padx=10, pady=(8, 0))
+    stats_lbl = ttk.Label(root, text="", foreground="#3498db")
+    stats_lbl.pack(anchor="w", padx=10)
 
     # --- trigger mic (sounddevice) ---
     mics = list_input_mics()
@@ -424,7 +549,7 @@ def run_gui(args):
             if n in saved_sources:
                 src_lb.selection_set(i)
     else:
-        auto_mic, auto_loop = pick_devices(args.mic, args.loopback)
+        auto_mic, auto_loop = pick_devices(args.mic, args.loopback, names=dshow)
         for i, n in enumerate(dshow):
             if n in (auto_mic, auto_loop):
                 src_lb.selection_set(i)
@@ -477,7 +602,11 @@ def run_gui(args):
         ro = "disabled" if locked else "readonly"
         mic_cb.config(state=ro)
         mon_cb.config(state=ro)
+        quality_cb.config(state=ro)
         src_lb.config(state=st)
+        pre_spin.config(state=st)
+        post_spin.config(state=st)
+        buf_entry.config(state=st)
 
     def _selected_region():
         i = mon_cb.current()
@@ -485,18 +614,62 @@ def run_gui(args):
             return None                    # all monitors
         return monitors[i - 1][:4]         # (x, y, w, h)
 
+    def _scale_h():
+        return QUALITY_PRESETS.get(quality_cb.get())
+
+    def _window():
+        try:
+            return max(1, int(pre_var.get())), max(1, int(post_var.get()))
+        except (TypeError, ValueError, tk.TclError):
+            return PRE, POST
+
+    def _capture_wh():
+        """Resolution ffmpeg will actually encode, for the footprint estimate."""
+        region = _selected_region()
+        if region:
+            cw, ch = region[2], region[3]
+        elif monitors:
+            x0 = min(m[0] for m in monitors); y0 = min(m[1] for m in monitors)
+            x1 = max(m[0] + m[2] for m in monitors); y1 = max(m[1] + m[3] for m in monitors)
+            cw, ch = x1 - x0, y1 - y0
+        else:
+            cw, ch = 1920, 1080
+        sh = _scale_h()
+        if sh and ch:
+            return max(2, round(cw * sh / ch / 2) * 2), sh
+        return cw, ch
+
+    def _update_stats():
+        if not stats_var.get():
+            stats_lbl.config(text="")
+            return
+        w, h = _capture_wh()
+        pre, post = _window()
+        retention = pre + post + MAX_EXTEND + 10
+        e = estimate_footprint(w, h, FPS, retention, pre + post)
+        loc = "RAM" if (buf_var.get().strip() or BUFDIR) != BUFDIR else "disk"
+        stats_lbl.config(text=(
+            "%dx%d @%dfps  ~%.1f Mb/s   buffer ~%d MB on %s (%ds)   clip ~%d MB   "
+            "ffmpeg RAM ~%d MB" % (w, h, FPS, e["mbps"], e["buffer_mb"], loc,
+                                   retention, e["clip_mb"], e["ram_mb"])))
+
     def _save_cfg():
         save_settings({"monitor": mon_cb.current(), "mic": mic_cb.get(),
                        "sources": _selected_sources(), "threshold": thr.get(),
-                       "folder": folder.get()})
+                       "folder": folder.get(), "quality": quality_cb.get(),
+                       "pre": _window()[0], "post": _window()[1],
+                       "bufdir": buf_var.get().strip() or BUFDIR,
+                       "stats": stats_var.get()})
 
     def start():
         if clipper["obj"]:
             return
         trig = mics[mic_cb.current()][0] if mics else None
+        pre, post = _window()
         c = Clipper(thr.get(), _selected_sources(), trigger_mic=trig,
                     on_event=log, clipdir=folder.get(), test_mode=test_var.get(),
-                    region=_selected_region())
+                    region=_selected_region(), pre=pre, post=post,
+                    scale_h=_scale_h(), bufdir=buf_var.get().strip() or BUFDIR)
         if c.start():
             clipper["obj"] = c
             _save_cfg()
@@ -563,6 +736,7 @@ def run_gui(args):
             root.title("Loudred - instant replay clipper")
         root.after(100, tick)
     tick()
+    _update_stats()                 # show the footprint now if the toggle is on
 
     def on_close():
         try:
