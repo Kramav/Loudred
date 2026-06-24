@@ -31,7 +31,10 @@ python app.py
 - Pick a **Capture quality** — Native, or downscale to 1080p/720p/480p to shrink
   CPU load and buffer size.
 - Set the **Clip window** — how many seconds before and after a peak to keep.
-- Optionally point the **Buffer folder** at a RAM disk (see *Sparing your SSD*).
+- Pick a **Video encoder** — CPU (x264) or your GPU (AMD/NVIDIA/Intel). The GPU
+  encoder offloads work from the CPU, the way ShadowPlay/ReLive do.
+- Choose the **Rolling buffer** — **RAM (default, no SSD writes)** or a disk
+  folder. RAM is recommended; see *Sparing your SSD*.
 - Tick **Stats for nerds** to see the estimated bitrate, rolling-buffer size,
   per-clip size and ffmpeg RAM for your current settings.
 - Pick your **Trigger mic** (the mic whose loudness arms a clip).
@@ -44,24 +47,25 @@ python app.py
 - Click **Start**. When your mic gets loud above the threshold, a clip is written
   to the clips folder. **Change…** moves that folder; **Open clips folder** opens it.
 
-All of these (monitor, quality, clip window, buffer folder, mic, sources,
-threshold, clips folder, stats toggle) are remembered between runs in
+All of these (monitor, quality, clip window, encoder, buffer mode/folder, mic,
+sources, threshold, clips folder, stats toggle) are remembered between runs in
 `loudred_settings.json` next to `app.py`.
 
 ## Sparing your SSD (RAM buffer)
 
-The rolling buffer writes a new ~1-second video segment every second, forever
-while recording — that's a lot of continuous writes on an SSD. To put the buffer
-in RAM instead, create a RAM disk and point the **Buffer folder** at it:
+The rolling buffer holds the last ~minute of video so a clip can reach back in
+time. By default Loudred keeps it **in RAM** — exactly how ShadowPlay/ReLive
+work — so **nothing is written to disk until you actually save a clip**. ffmpeg
+streams fragmented MP4 into memory; on a peak, the relevant fragments are written
+out as one mp4. No SSD wear, no setup, no RAM disk needed.
 
-1. Install a RAM-disk tool (e.g. the free **ImDisk Toolkit** or **OSFMount**).
-2. Create a small RAM disk — a few hundred MB is plenty (the *Stats for nerds*
-   readout shows how much the buffer needs for your settings). Give it a drive
-   letter, e.g. `R:`.
-3. Set **Buffer folder** to something like `R:\loudred` and Start.
+The *Stats for nerds* readout shows how much RAM the buffer uses for your
+settings (typically tens of MB; a few hundred for a long window at high quality).
 
-Saved clips still go to your normal (disk) clips folder — only the short-lived
-rolling buffer lives in RAM, so nothing is lost if the RAM disk clears on reboot.
+If you'd rather not use RAM (huge buffers, or a low-memory machine), switch
+**Rolling buffer** to *Disk folder* — that uses the classic 1-second-segment
+approach in the folder you name. Saved clips always go to your normal clips
+folder either way.
 
 List detected audio devices:
 

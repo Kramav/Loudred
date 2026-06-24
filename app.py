@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import threading
 import time
+from collections import deque
 from ctypes import wintypes
 from datetime import datetime
 
@@ -34,6 +35,9 @@ FPS = 30
 BUFDIR = "buffer"
 CLIPDIR = "clips"
 QUALITY_PRESETS = {"Native": None, "1080p": 1080, "720p": 720, "480p": 480}
+ENCODER_LABELS = {"CPU (x264)": "libx264", "AMD GPU (AMF)": "h264_amf",
+                  "NVIDIA GPU (NVENC)": "h264_nvenc", "Intel GPU (QSV)": "h264_qsv"}
+BUFFER_LABELS = {"RAM (in memory, no SSD writes)": "ram", "Disk folder": "disk"}
 SEG_GLOB = "seg_*.ts"
 SEG_FMT = "seg_%Y%m%d_%H%M%S.ts"
 LOOPBACK_HINTS = ("stereo mix", "cable output", "loopback", "what u hear",
@@ -167,14 +171,17 @@ def list_monitors():
 
 # ---- continuous recorder + pruner ----
 
-def build_ffmpeg_cmd(audio_devices, region=None, scale_h=None, bufdir=BUFDIR):
+def build_ffmpeg_cmd(audio_devices, region=None, scale_h=None, bufdir=BUFDIR,
+                     ram=False, encoder="libx264"):
     """ffmpeg cmd: screen video + any number of dshow audio sources mixed to one track.
 
     region   = (x, y, w, h) crops gdigrab to one monitor; None = whole virtual desktop.
     scale_h  = downscale video to this many lines (keeps aspect, even width);
                None = capture at native resolution.
-    bufdir   = directory the 1s segments are written to (point at a RAM disk to
-               avoid SSD write wear).
+    bufdir   = directory the 1s segments are written to (disk-buffer mode only).
+    ram      = True -> fragmented MP4 to stdout for an in-RAM ring buffer (no disk);
+               False -> 1s .ts segments written to bufdir.
+    encoder  = video encoder id (libx264 / h264_amf / h264_nvenc / h264_qsv).
     """
     cmd = ["ffmpeg", "-hide_banner", "-y", "-f", "gdigrab", "-framerate", str(FPS)]
     if region:
@@ -203,12 +210,34 @@ def build_ffmpeg_cmd(audio_devices, region=None, scale_h=None, bufdir=BUFDIR):
     if chains:
         cmd += ["-filter_complex", ";".join(chains)]
     cmd += maps
-    cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
-            "-c:a", "aac",
-            "-f", "segment", "-segment_time", str(SEG_LEN),
-            "-reset_timestamps", "1", "-strftime", "1",
-            os.path.join(bufdir, SEG_FMT)]
+    cmd += _venc_args(encoder)
+    cmd += ["-c:a", "aac"]
+    if ram:
+        # Fragmented MP4 to stdout: each fragment is a self-contained,
+        # keyframe-aligned moof+mdat, so a RAM ring buffer can keep/drop whole
+        # fragments and concat init+fragments into a playable clip - no disk.
+        cmd += ["-g", str(FPS),
+                "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+                "-f", "mp4", "pipe:1"]
+    else:
+        cmd += ["-f", "segment", "-segment_time", str(SEG_LEN),
+                "-reset_timestamps", "1", "-strftime", "1",
+                os.path.join(bufdir, SEG_FMT)]
     return cmd
+
+
+def _venc_args(encoder):
+    """Video-encoder ffmpeg args. GPU encoders (AMF/NVENC/QSV) offload from the
+    CPU the way ReLive/ShadowPlay do; they don't shrink disk/RAM use (bitrate is
+    similar). If the chosen encoder isn't built into the user's ffmpeg, ffmpeg
+    exits and _watch_proc surfaces it."""
+    if encoder == "h264_amf":           # AMD / Radeon
+        return ["-c:v", "h264_amf", "-usage", "lowlatency", "-quality", "speed"]
+    if encoder == "h264_nvenc":         # NVIDIA
+        return ["-c:v", "h264_nvenc", "-preset", "p1", "-tune", "ll"]
+    if encoder == "h264_qsv":           # Intel
+        return ["-c:v", "h264_qsv", "-preset", "veryfast"]
+    return ["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"]
 
 
 # Rough H.264-ultrafast bits per pixel per frame. Content-dependent (motion,
@@ -219,10 +248,10 @@ BITS_PER_PIXEL = 0.10
 def estimate_footprint(width, height, fps, buffer_secs, clip_secs):
     """Rough resource estimate for capturing WxH@fps. Returns a dict of:
       mbps      - encoded video bitrate (Mbit/s)
-      buffer_mb - rolling buffer on DISK (buffer_secs of video)
+      buffer_mb - rolling buffer size (buffer_secs of video) - lives in RAM or on
+                  disk depending on buffer mode; either way this is what grows
       clip_mb   - one saved clip on disk (clip_secs of video)
-      ram_mb    - rough ffmpeg+python working set (mostly resolution-independent)
-    The buffer is on disk, not RAM - that's the number that grows with resolution.
+      ram_mb    - rough ffmpeg+python working set, excluding the RAM-mode buffer
     """
     bps = width * height * fps * BITS_PER_PIXEL          # bits/sec
     raw_frame_mb = width * height * 1.5 / 1e6            # yuv420 bytes/frame
@@ -295,12 +324,92 @@ def build_clip(first_peak, last_peak, log, clipdir=CLIPDIR, pre=PRE, post=POST, 
     return out
 
 
+def iter_mp4_boxes(read):
+    """Yield (type, raw_bytes) for each top-level MP4 box read from `read` (a
+    file.read-style callable returning b'' at EOF). Box = 4-byte big-endian size
+    + 4-byte type [+ 8-byte largesize if size==1] + payload."""
+    buf = b""
+
+    def fill(n):
+        nonlocal buf
+        while len(buf) < n:
+            chunk = read(65536)
+            if not chunk:
+                return False
+            buf += chunk
+        return True
+
+    while True:
+        if not fill(8):
+            return
+        size = int.from_bytes(buf[:4], "big")
+        btype = buf[4:8].decode("latin1", "replace")
+        if size == 1:                       # 64-bit largesize
+            if not fill(16):
+                return
+            size = int.from_bytes(buf[8:16], "big")
+        if size < 8:                        # 0 (= to EOF) or garbage: bail safely
+            return
+        if not fill(size):
+            return
+        yield btype, buf[:size]
+        buf = buf[size:]
+
+
+class RamBuffer:
+    """Rolling in-RAM ring buffer of fragmented-MP4 fragments (the ShadowPlay/
+    ReLive approach: keep the last `retention` seconds of encoded video in memory,
+    write to disk only when a clip is saved - no continuous SSD writes)."""
+
+    def __init__(self, retention):
+        self.retention = retention
+        self.init = b""                     # ftyp + moov (the init segment)
+        self.frags = deque()                # (arrival_epoch, moof+mdat bytes)
+        self._lock = threading.Lock()
+
+    def feed_stream(self, read, stop):
+        """Consume ffmpeg's fMP4 stdout until EOF/stop, indexing fragments by
+        wall-clock arrival (~media time within sub-second, matching clip precision)."""
+        init_parts, pending, have_moof = [], b"", False
+        for btype, data in iter_mp4_boxes(read):
+            if stop.is_set():
+                break
+            if not self.init:
+                init_parts.append(data)
+                if btype == "moov":
+                    with self._lock:
+                        self.init = b"".join(init_parts)
+                continue
+            if btype == "styp":
+                pending = data
+            elif btype == "moof":
+                pending += data
+                have_moof = True
+            elif btype == "mdat" and have_moof:
+                now = time.time()
+                with self._lock:
+                    self.frags.append((now, pending + data))
+                    self._prune(now)
+                pending, have_moof = b"", False
+
+    def _prune(self, now):
+        cutoff = now - self.retention
+        while self.frags and self.frags[0][0] < cutoff:
+            self.frags.popleft()
+
+    def slice(self, lo, hi):
+        """(init, [fragment bytes]) for fragments that arrived within [lo, hi]."""
+        with self._lock:
+            return self.init, [b for (t, b) in self.frags if lo <= t <= hi]
+
+
 class Clipper:
     """Owns the ffmpeg recorder, pruner, mic-trigger and clip building."""
 
     def __init__(self, threshold, audio_devices, trigger_mic=None, on_event=print,
                  clipdir=CLIPDIR, test_mode=False, region=None,
-                 pre=PRE, post=POST, scale_h=None, bufdir=BUFDIR):
+                 pre=PRE, post=POST, scale_h=None, bufdir=BUFDIR,
+                 buffer_mode="ram", encoder="libx264"):
         self.threshold = threshold
         self.audio_devices = list(audio_devices)   # dshow names recorded into the clip
         self.trigger_mic = trigger_mic             # sounddevice index/name; None = default
@@ -308,7 +417,9 @@ class Clipper:
         self.pre = pre                             # seconds kept before a peak
         self.post = post                           # seconds kept after a peak
         self.scale_h = scale_h                     # downscale height; None = native
-        self.bufdir = bufdir                       # where 1s segments live (RAM disk = no SSD wear)
+        self.bufdir = bufdir                       # disk-buffer folder (disk mode only)
+        self.buffer_mode = buffer_mode             # "ram" (no SSD writes) | "disk"
+        self.encoder = encoder                     # libx264 / h264_amf / h264_nvenc / h264_qsv
         # buffer must outlast the longest possible clip (window + extension + margin)
         self.retention = pre + post + MAX_EXTEND + 10
         self.on_event = on_event
@@ -319,6 +430,8 @@ class Clipper:
         self.state = "idle"        # idle | armed | capturing | cooldown | error
         self._proc = None
         self._errlog = None
+        self._logpath = "ffmpeg.log"
+        self._rambuf = None        # RamBuffer when buffer_mode == "ram"
         self._stop = threading.Event()
         self._stream = None
         self._armed = True
@@ -327,17 +440,24 @@ class Clipper:
         self._lock = threading.Lock()
 
     def start(self):
-        os.makedirs(self.bufdir, exist_ok=True)
+        ram = self.buffer_mode == "ram"
         os.makedirs(self.clipdir, exist_ok=True)
+        if ram:
+            self._logpath = os.path.join(os.path.dirname(SETTINGS_FILE), "ffmpeg.log")
+        else:
+            os.makedirs(self.bufdir, exist_ok=True)
+            self._logpath = os.path.join(self.bufdir, "ffmpeg.log")
         if not self.audio_devices:
             self.on_event("WARNING: no audio sources selected - clips will be video-only.")
         vid = ("monitor %dx%d at (%d,%d)" % (self.region[2], self.region[3],
                self.region[0], self.region[1])) if self.region else "ALL monitors (whole desktop)"
         if self.scale_h:
             vid += " -> scaled to %dp" % self.scale_h
-        self.on_event("Video: " + vid)
+        self.on_event("Video: %s  [%s]" % (vid, self.encoder))
         self.on_event("Recording sources: " + (", ".join(self.audio_devices) or "NONE"))
-        self.on_event("Buffer: %s (%ds rolling)" % (os.path.abspath(self.bufdir), self.retention))
+        self.on_event("Buffer: %s (%ds rolling)"
+                      % ("RAM (in memory)" if ram else os.path.abspath(self.bufdir),
+                         self.retention))
         self._stop.clear()
         # ponytail: mic opened twice (ffmpeg records, sounddevice triggers).
         # Windows shared-mode allows this; if it ever fails, parse ffmpeg
@@ -349,12 +469,20 @@ class Clipper:
         except Exception as e:
             self.on_event("Trigger mic failed to open: %s" % e)
             return False
-        self._errlog = open(os.path.join(self.bufdir, "ffmpeg.log"), "w")
-        self._proc = subprocess.Popen(
-            build_ffmpeg_cmd(self.audio_devices, self.region, self.scale_h, self.bufdir),
-            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=self._errlog)
-        threading.Thread(target=prune_loop,
-                         args=(self._stop, self.retention, self.bufdir), daemon=True).start()
+        self._errlog = open(self._logpath, "w")
+        cmd = build_ffmpeg_cmd(self.audio_devices, self.region, self.scale_h,
+                               self.bufdir, ram=ram, encoder=self.encoder)
+        if ram:
+            self._rambuf = RamBuffer(self.retention)
+            self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                          stdout=subprocess.PIPE, stderr=self._errlog)
+            threading.Thread(target=self._rambuf.feed_stream,
+                             args=(self._proc.stdout.read, self._stop), daemon=True).start()
+        else:
+            self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                          stdout=subprocess.DEVNULL, stderr=self._errlog)
+            threading.Thread(target=prune_loop,
+                             args=(self._stop, self.retention, self.bufdir), daemon=True).start()
         threading.Thread(target=self._watch_proc, daemon=True).start()
         self.state = "armed"
         self.on_event("Recording. Buffering %ds; clips = %ds before + %ds after a peak.%s"
@@ -372,7 +500,7 @@ class Clipper:
         if not self._stop.is_set():
             self.state = "error"
             self.on_event("Recorder (ffmpeg) stopped unexpectedly (exit %s). See %s"
-                          % (code, os.path.join(self.bufdir, "ffmpeg.log")))
+                          % (code, self._logpath))
 
     def _on_audio(self, indata, frames, t, status):
         lvl = rms_level(indata[:, 0])
@@ -407,8 +535,11 @@ class Clipper:
             first, last = self._first_peak, self._last_peak
         if last > first:
             self.on_event("Loud streak: extended clip to %ds." % int(last - first + self.pre + self.post))
-        out = build_clip(first, last, self.on_event, self.clipdir,
-                         self.pre, self.post, self.bufdir)
+        if self.buffer_mode == "ram":
+            out = self._save_ram_clip(first, last)
+        else:
+            out = build_clip(first, last, self.on_event, self.clipdir,
+                             self.pre, self.post, self.bufdir)
         if out:
             self.clip_count += 1
         self.state = "cooldown"
@@ -416,6 +547,28 @@ class Clipper:
         with self._lock:
             self._armed = True
             self.state = "armed"
+
+    def _save_ram_clip(self, first, last):
+        """Write a clip straight from the RAM ring buffer: init segment + the
+        fragments inside [first-pre, last+post]. The fragments are keyframe-aligned
+        fMP4, so init + fragments is already a playable file - no remux."""
+        init, frags = self._rambuf.slice(first - self.pre, last + self.post)
+        if not init or not frags:
+            self.on_event("No buffered video to clip yet.")
+            return None
+        os.makedirs(self.clipdir, exist_ok=True)
+        out = os.path.join(self.clipdir,
+                           "clip_%s.mp4" % datetime.fromtimestamp(first).strftime("%Y%m%d_%H%M%S"))
+        try:
+            with open(out, "wb") as f:
+                f.write(init)
+                for fr in frags:
+                    f.write(fr)
+        except OSError as e:
+            self.on_event("Clip write failed: %s" % e)
+            return None
+        self.on_event("Saved " + out)
+        return out
 
     def stop(self):
         self._stop.set()
@@ -444,7 +597,7 @@ def run_gui(args):
 
     root = tk.Tk()
     root.title("Loudred - instant replay clipper")
-    root.geometry("560x860")
+    root.geometry("560x940")
 
     # red "record" dot as the window/taskbar icon (no file, no extra dependency)
     icon = tk.PhotoImage(width=64, height=64)
@@ -507,13 +660,26 @@ def run_gui(args):
                             command=lambda: _update_stats())
     post_spin.pack(side="left", padx=4)
 
-    # --- buffer location (a RAM-disk path spares SSD write cycles) ---
-    ttk.Label(root, text="Buffer folder (point at a RAM disk to spare your SSD):"
-              ).pack(anchor="w", padx=10, pady=(8, 0))
+    # --- video encoder (GPU offloads encoding from the CPU, ReLive-style) ---
+    ttk.Label(root, text="Video encoder:").pack(anchor="w", padx=10, pady=(8, 0))
+    enc_cb = ttk.Combobox(root, state="readonly", values=list(ENCODER_LABELS))
+    enc_cb.set(next((lbl for lbl, eid in ENCODER_LABELS.items()
+                     if eid == cfg.get("encoder")), "CPU (x264)"))
+    enc_cb.pack(fill="x", padx=10)
+
+    # --- rolling buffer: RAM by default (no SSD writes), or a disk folder ---
+    ttk.Label(root, text="Rolling buffer:").pack(anchor="w", padx=10, pady=(8, 0))
+    bufmode_cb = ttk.Combobox(root, state="readonly", values=list(BUFFER_LABELS))
+    bufmode_cb.set(next((lbl for lbl, m in BUFFER_LABELS.items()
+                         if m == cfg.get("buffer_mode")), "RAM (in memory, no SSD writes)"))
+    bufmode_cb.pack(fill="x", padx=10)
+    bufmode_cb.bind("<<ComboboxSelected>>", lambda e: (_sync_buf_entry(), _update_stats()))
     buf_var = tk.StringVar(value=cfg.get("bufdir", BUFDIR))
     buf_entry = ttk.Entry(root, textvariable=buf_var)
     buf_entry.pack(fill="x", padx=10)
     buf_var.trace_add("write", lambda *a: _update_stats())
+    if BUFFER_LABELS.get(bufmode_cb.get()) != "disk":
+        buf_entry.config(state="disabled")     # folder only matters in disk mode
 
     # --- stats for nerds ---
     stats_var = tk.BooleanVar(value=bool(cfg.get("stats", False)))
@@ -597,16 +763,29 @@ def run_gui(args):
     def _selected_sources():
         return [dshow[i] for i in src_lb.curselection()]
 
+    def _encoder():
+        return ENCODER_LABELS.get(enc_cb.get(), "libx264")
+
+    def _buffer_mode():
+        return BUFFER_LABELS.get(bufmode_cb.get(), "ram")
+
+    def _sync_buf_entry():
+        buf_entry.config(state="normal" if _buffer_mode() == "disk" else "disabled")
+
     def _lock_inputs(locked):
         st = "disabled" if locked else "normal"
         ro = "disabled" if locked else "readonly"
         mic_cb.config(state=ro)
         mon_cb.config(state=ro)
         quality_cb.config(state=ro)
+        enc_cb.config(state=ro)
+        bufmode_cb.config(state=ro)
         src_lb.config(state=st)
         pre_spin.config(state=st)
         post_spin.config(state=st)
         buf_entry.config(state=st)
+        if not locked:
+            _sync_buf_entry()              # folder stays disabled in RAM mode
 
     def _selected_region():
         i = mon_cb.current()
@@ -647,7 +826,7 @@ def run_gui(args):
         pre, post = _window()
         retention = pre + post + MAX_EXTEND + 10
         e = estimate_footprint(w, h, FPS, retention, pre + post)
-        loc = "RAM" if (buf_var.get().strip() or BUFDIR) != BUFDIR else "disk"
+        loc = "RAM" if _buffer_mode() == "ram" else "disk"
         stats_lbl.config(text=(
             "%dx%d @%dfps  ~%.1f Mb/s   buffer ~%d MB on %s (%ds)   clip ~%d MB   "
             "ffmpeg RAM ~%d MB" % (w, h, FPS, e["mbps"], e["buffer_mb"], loc,
@@ -659,6 +838,7 @@ def run_gui(args):
                        "folder": folder.get(), "quality": quality_cb.get(),
                        "pre": _window()[0], "post": _window()[1],
                        "bufdir": buf_var.get().strip() or BUFDIR,
+                       "buffer_mode": _buffer_mode(), "encoder": _encoder(),
                        "stats": stats_var.get()})
 
     def start():
@@ -669,7 +849,8 @@ def run_gui(args):
         c = Clipper(thr.get(), _selected_sources(), trigger_mic=trig,
                     on_event=log, clipdir=folder.get(), test_mode=test_var.get(),
                     region=_selected_region(), pre=pre, post=post,
-                    scale_h=_scale_h(), bufdir=buf_var.get().strip() or BUFDIR)
+                    scale_h=_scale_h(), bufdir=buf_var.get().strip() or BUFDIR,
+                    buffer_mode=_buffer_mode(), encoder=_encoder())
         if c.start():
             clipper["obj"] = c
             _save_cfg()

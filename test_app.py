@@ -1,4 +1,8 @@
 """Pure-logic checks - no audio/video hardware, no ffmpeg."""
+import io
+import struct
+import threading
+
 import numpy as np
 
 import app
@@ -115,6 +119,51 @@ def test_build_ffmpeg_scale():
     assert "ramdisk" in " ".join(build_ffmpeg_cmd([], bufdir="ramdisk"))
 
 
+def test_build_ffmpeg_ram_and_encoder():
+    # RAM mode -> fragmented mp4 to stdout, no segment muxer
+    j = " ".join(build_ffmpeg_cmd([], ram=True))
+    assert "pipe:1" in j and "frag_keyframe" in j and "-f segment" not in j
+    # disk mode (default) still segments
+    assert "-f segment" in " ".join(build_ffmpeg_cmd([]))
+    # GPU encoder swaps the codec
+    ja = " ".join(build_ffmpeg_cmd([], encoder="h264_amf"))
+    assert "h264_amf" in ja and "libx264" not in ja
+    assert "h264_nvenc" in " ".join(build_ffmpeg_cmd([], encoder="h264_nvenc"))
+
+
+def _box(btype, payload=b""):
+    return struct.pack(">I", 8 + len(payload)) + btype.encode("latin1") + payload
+
+
+def test_iter_mp4_boxes():
+    stream = _box("ftyp", b"isom") + _box("moov", b"x" * 20) + _box("moof", b"a")
+    got = [(t, len(d)) for t, d in app.iter_mp4_boxes(io.BytesIO(stream).read)]
+    assert [t for t, _ in got] == ["ftyp", "moov", "moof"]
+    # a box split across reads still parses (size header may arrive in pieces)
+    src = io.BytesIO(stream)
+    assert sum(len(d) for _, d in app.iter_mp4_boxes(lambda n: src.read(3))) == len(stream)
+
+
+def test_rambuffer_feed_and_slice():
+    stream = (_box("ftyp", b"isom") + _box("moov", b"m" * 16)
+              + _box("moof", b"a") + _box("mdat", b"AAAA")
+              + _box("moof", b"b") + _box("mdat", b"BBBB"))
+    rb = app.RamBuffer(retention=60)
+    rb.feed_stream(io.BytesIO(stream).read, threading.Event())
+    assert rb.init == _box("ftyp", b"isom") + _box("moov", b"m" * 16)
+    assert len(rb.frags) == 2                       # two moof+mdat fragments
+    assert rb.frags[0][1] == _box("moof", b"a") + _box("mdat", b"AAAA")
+
+    # slice picks fragments by arrival time; prune drops old ones
+    rb2 = app.RamBuffer(retention=60)
+    rb2.init = b"INIT"
+    rb2.frags.extend([(100.0, b"f1"), (105.0, b"f2"), (110.0, b"f3")])
+    init, fr = rb2.slice(104, 111)
+    assert init == b"INIT" and fr == [b"f2", b"f3"]
+    rb2._prune(now=170.0)                            # cutoff 110 -> drops f1,f2
+    assert [t for t, _ in rb2.frags] == [110.0]
+
+
 def test_estimate_footprint():
     e = estimate_footprint(1920, 1080, 30, buffer_secs=60, clip_secs=30)
     # bitrate scales with pixels*fps*BPP; sanity-check order of magnitude
@@ -148,6 +197,9 @@ if __name__ == "__main__":
     test_select_range_merged_window()
     test_build_ffmpeg_cmd()
     test_build_ffmpeg_scale()
+    test_build_ffmpeg_ram_and_encoder()
+    test_iter_mp4_boxes()
+    test_rambuffer_feed_and_slice()
     test_estimate_footprint()
     test_device_enumeration()
     print("ok")

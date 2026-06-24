@@ -150,12 +150,23 @@ Added as GUI settings (all persisted to `loudred_settings.json`):
   configurable, so it can point at a RAM disk to avoid SSD write wear. README has
   the ImDisk/OSFMount setup.
 
-### Still open: zero-dependency in-RAM ring buffer
-The buffer-folder approach needs the user to create a RAM disk (one external
-tool). A driver-free alternative: have ffmpeg emit MPEG-TS to `pipe:1` with a
-forced ~1s keyframe interval, keep the last N seconds of TS bytes in a Python
-deque (a pure, testable ring buffer), and on trigger write the slice to `.ts` and
-remux to mp4. **Caveat:** cutting/concatenating a live TS stream (packet + GOP
-alignment, A/V sync, start-PTS) is fragile and can't be validated without real
-ffmpeg + playback, so it's deferred rather than shipped half-working. The RAM-disk
-path is the robust version today.
+### ✅ DONE: zero-dependency in-RAM ring buffer (the ShadowPlay/ReLive approach)
+RAM is now the **default** rolling buffer — no RAM disk, no SSD writes until a
+clip is saved. ffmpeg streams fragmented MP4 to `pipe:1`
+(`-movflags frag_keyframe+empty_moov+default_base_moof -g fps -f mp4`);
+[iter_mp4_boxes](app.py) splits the stream on MP4 box boundaries and
+[RamBuffer](app.py) keeps the last `retention` seconds of keyframe-aligned
+`moof`+`mdat` fragments in a `deque`, indexed by arrival time. On a peak it writes
+`init + fragments` straight to an mp4 — no remux. Disk-segment mode is kept as an
+option (`buffer_mode="disk"`) for very long buffers / low-RAM machines.
+
+**Caveat still standing:** the box-parsing + ring-buffer logic is unit-tested, but
+playback parity of the assembled fMP4 (start-PTS, A/V sync across players) can only
+be confirmed on a real run with real ffmpeg — verify a saved clip plays in your
+player of choice.
+
+### ✅ DONE: GPU hardware encoder option
+Video-encoder dropdown — CPU (`libx264`) or GPU (`h264_amf` / `h264_nvenc` /
+`h264_qsv`), via [_venc_args](app.py). Offloads encoding from the CPU like ReLive;
+does not change disk/RAM use (bitrate is similar). If the chosen encoder isn't in
+the user's ffmpeg build, ffmpeg exits and the "RECORDER DIED" state surfaces it.
