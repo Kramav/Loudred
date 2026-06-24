@@ -10,15 +10,17 @@ laugh — whatever crosses the threshold).
 1. **Install ffmpeg** and make sure it's on your `PATH`
    (`ffmpeg -version` should work in a terminal).
 2. **Install Python deps:** `pip install -r requirements.txt`
-3. **Enable a loopback audio device** so desktop + Discord audio can be captured
-   (ffmpeg can't tap Windows output directly):
-   - **Easiest:** enable **Stereo Mix** — Sound settings → More sound settings →
-     Recording tab → right-click → Show Disabled Devices → enable *Stereo Mix*.
-   - **If you have no Stereo Mix:** install the free
-     [VB-Audio Virtual Cable](https://vb-audio.com/Cable/), set it as an
-     *additional* playback path, or use "Listen to this device" to route output
-     through it. The app auto-detects `CABLE Output`.
-   - No loopback? The app still runs — clips just contain **mic audio only**.
+3. **Desktop audio (game + Discord + browser)** — pick one:
+   - **Easiest, no cable:** `pip install soundcard` (it's in `requirements.txt`),
+     then tick **"Also record desktop audio"** in the app. This uses Windows'
+     native **WASAPI loopback** to grab whatever your speakers are playing — no
+     Stereo Mix, no virtual cable, no setup.
+   - **Or a loopback device** (if you'd rather route through ffmpeg/dshow): enable
+     **Stereo Mix** (Sound settings → More sound settings → Recording → Show
+     Disabled Devices → enable *Stereo Mix*), or install the free
+     [VB-Audio Virtual Cable](https://vb-audio.com/Cable/); the app auto-detects
+     `Stereo Mix` / `CABLE Output` in the audio-sources list.
+   - Neither? The app still runs — clips just contain **mic audio only**.
 
 ## Run
 

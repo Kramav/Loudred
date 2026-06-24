@@ -35,6 +35,9 @@ FPS = 30
 BUFDIR = "buffer"
 CLIPDIR = "clips"
 QUALITY_PRESETS = {"Native": None, "1080p": 1080, "720p": 720, "480p": 480}
+AUDIO_SR = 48000            # desktop-loopback PCM piped to ffmpeg
+AUDIO_CH = 2
+AUDIO_FMT = "f32le"         # soundcard yields float32 frames
 ENCODER_LABELS = {"CPU (x264)": "libx264", "AMD GPU (AMF)": "h264_amf",
                   "NVIDIA GPU (NVENC)": "h264_nvenc", "Intel GPU (QSV)": "h264_qsv"}
 BUFFER_LABELS = {"RAM (in memory, no SSD writes)": "ram", "Disk folder": "disk"}
@@ -137,6 +140,40 @@ def list_input_mics():
         return []
 
 
+def have_soundcard():
+    """True if the optional `soundcard` lib (WASAPI loopback) is importable."""
+    try:
+        import soundcard  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def capture_loopback(write, stop, on_event=lambda m: None):
+    """Capture the default speaker's WASAPI loopback and push float32 PCM to
+    `write` until `stop` is set. This is desktop audio (game + Discord + browser)
+    without Stereo Mix or a virtual cable - Windows' native per-endpoint loopback.
+    Runs in its own thread; any failure is reported and ends the thread."""
+    try:
+        import soundcard as sc
+    except ImportError:
+        on_event("Desktop audio needs 'soundcard' (pip install soundcard). Skipping.")
+        return
+    try:
+        spk = sc.default_speaker()
+        mic = sc.get_microphone(spk.name, include_loopback=True)
+        with mic.recorder(samplerate=AUDIO_SR, channels=AUDIO_CH) as rec:
+            on_event("Desktop audio: capturing '%s' via WASAPI loopback." % spk.name)
+            while not stop.is_set():
+                data = rec.record(numframes=2048)        # (frames, channels) float32
+                try:
+                    write(np.ascontiguousarray(data, dtype=np.float32).tobytes())
+                except (OSError, ValueError):
+                    break                                # ffmpeg/pipe gone
+    except Exception as e:
+        on_event("Desktop audio capture failed: %s" % e)
+
+
 def set_dpi_aware():
     """Make this process per-monitor DPI aware so monitor rects are in physical
     pixels and line up with what gdigrab actually captures under display scaling."""
@@ -172,7 +209,7 @@ def list_monitors():
 # ---- continuous recorder + pruner ----
 
 def build_ffmpeg_cmd(audio_devices, region=None, scale_h=None, bufdir=BUFDIR,
-                     ram=False, encoder="libx264"):
+                     ram=False, encoder="libx264", desktop_audio=False):
     """ffmpeg cmd: screen video + any number of dshow audio sources mixed to one track.
 
     region   = (x, y, w, h) crops gdigrab to one monitor; None = whole virtual desktop.
@@ -182,6 +219,8 @@ def build_ffmpeg_cmd(audio_devices, region=None, scale_h=None, bufdir=BUFDIR,
     ram      = True -> fragmented MP4 to stdout for an in-RAM ring buffer (no disk);
                False -> 1s .ts segments written to bufdir.
     encoder  = video encoder id (libx264 / h264_amf / h264_nvenc / h264_qsv).
+    desktop_audio = True -> read WASAPI-loopback PCM from stdin (pipe:0) as one more
+               audio source (desktop sound without Stereo Mix / a virtual cable).
     """
     cmd = ["ffmpeg", "-hide_banner", "-y", "-f", "gdigrab", "-framerate", str(FPS)]
     if region:
@@ -191,6 +230,10 @@ def build_ffmpeg_cmd(audio_devices, region=None, scale_h=None, bufdir=BUFDIR,
     for d in audio_devices:
         cmd += ["-f", "dshow", "-i", "audio=" + d]
     n = len(audio_devices)
+    audio_idx = list(range(1, n + 1))               # dshow input indices
+    if desktop_audio:                               # loopback PCM on stdin = next index
+        cmd += ["-f", AUDIO_FMT, "-ar", str(AUDIO_SR), "-ac", str(AUDIO_CH), "-i", "pipe:0"]
+        audio_idx.append(n + 1)
 
     # Build one filtergraph for whatever needs filtering (video scale, audio mix);
     # map everything else straight through. -vf can't coexist with -filter_complex,
@@ -201,11 +244,11 @@ def build_ffmpeg_cmd(audio_devices, region=None, scale_h=None, bufdir=BUFDIR,
         maps += ["-map", "[v]"]
     else:
         maps += ["-map", "0:v"]
-    if n == 1:
-        maps += ["-map", "1:a"]
-    elif n >= 2:
-        ins = "".join("[%d:a]" % (i + 1) for i in range(n))
-        chains.append("%samix=inputs=%d:duration=longest[a]" % (ins, n))
+    if len(audio_idx) == 1:
+        maps += ["-map", "%d:a" % audio_idx[0]]
+    elif len(audio_idx) >= 2:
+        ins = "".join("[%d:a]" % i for i in audio_idx)
+        chains.append("%samix=inputs=%d:duration=longest[a]" % (ins, len(audio_idx)))
         maps += ["-map", "[a]"]
     if chains:
         cmd += ["-filter_complex", ";".join(chains)]
@@ -409,7 +452,7 @@ class Clipper:
     def __init__(self, threshold, audio_devices, trigger_mic=None, on_event=print,
                  clipdir=CLIPDIR, test_mode=False, region=None,
                  pre=PRE, post=POST, scale_h=None, bufdir=BUFDIR,
-                 buffer_mode="ram", encoder="libx264"):
+                 buffer_mode="ram", encoder="libx264", desktop_audio=False):
         self.threshold = threshold
         self.audio_devices = list(audio_devices)   # dshow names recorded into the clip
         self.trigger_mic = trigger_mic             # sounddevice index/name; None = default
@@ -420,6 +463,7 @@ class Clipper:
         self.bufdir = bufdir                       # disk-buffer folder (disk mode only)
         self.buffer_mode = buffer_mode             # "ram" (no SSD writes) | "disk"
         self.encoder = encoder                     # libx264 / h264_amf / h264_nvenc / h264_qsv
+        self.desktop_audio = desktop_audio         # WASAPI loopback PCM on stdin (no cable)
         # buffer must outlast the longest possible clip (window + extension + margin)
         self.retention = pre + post + MAX_EXTEND + 10
         self.on_event = on_event
@@ -454,7 +498,8 @@ class Clipper:
         if self.scale_h:
             vid += " -> scaled to %dp" % self.scale_h
         self.on_event("Video: %s  [%s]" % (vid, self.encoder))
-        self.on_event("Recording sources: " + (", ".join(self.audio_devices) or "NONE"))
+        srcs = list(self.audio_devices) + (["Desktop audio (loopback)"] if self.desktop_audio else [])
+        self.on_event("Recording sources: " + (", ".join(srcs) or "NONE"))
         self.on_event("Buffer: %s (%ds rolling)"
                       % ("RAM (in memory)" if ram else os.path.abspath(self.bufdir),
                          self.retention))
@@ -471,18 +516,22 @@ class Clipper:
             return False
         self._errlog = open(self._logpath, "w")
         cmd = build_ffmpeg_cmd(self.audio_devices, self.region, self.scale_h,
-                               self.bufdir, ram=ram, encoder=self.encoder)
+                               self.bufdir, ram=ram, encoder=self.encoder,
+                               desktop_audio=self.desktop_audio)
+        out = subprocess.PIPE if ram else subprocess.DEVNULL
+        self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                      stdout=out, stderr=self._errlog)
         if ram:
             self._rambuf = RamBuffer(self.retention)
-            self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
-                                          stdout=subprocess.PIPE, stderr=self._errlog)
             threading.Thread(target=self._rambuf.feed_stream,
                              args=(self._proc.stdout.read, self._stop), daemon=True).start()
         else:
-            self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
-                                          stdout=subprocess.DEVNULL, stderr=self._errlog)
             threading.Thread(target=prune_loop,
                              args=(self._stop, self.retention, self.bufdir), daemon=True).start()
+        if self.desktop_audio:               # feed loopback PCM into ffmpeg's stdin
+            threading.Thread(target=capture_loopback,
+                             args=(self._proc.stdin.write, self._stop, self.on_event),
+                             daemon=True).start()
         threading.Thread(target=self._watch_proc, daemon=True).start()
         self.state = "armed"
         self.on_event("Recording. Buffering %ds; clips = %ds before + %ds after a peak.%s"
@@ -576,8 +625,14 @@ class Clipper:
             self._stream.stop(); self._stream.close(); self._stream = None
         if self._proc:
             try:
-                self._proc.stdin.write(b"q")   # ask ffmpeg to finalize segments
-                self._proc.stdin.flush()
+                if self.desktop_audio:
+                    # stdin is the PCM feed, not the command channel - the capture
+                    # thread already stopped (self._stop set); just close + terminate.
+                    self._proc.stdin.close()
+                    self._proc.terminate()
+                else:
+                    self._proc.stdin.write(b"q")   # ask ffmpeg to finalize segments
+                    self._proc.stdin.flush()
                 self._proc.wait(timeout=5)
             except Exception:
                 self._proc.terminate()
@@ -597,7 +652,7 @@ def run_gui(args):
 
     root = tk.Tk()
     root.title("Loudred - instant replay clipper")
-    root.geometry("560x940")
+    root.geometry("560x980")
 
     # red "record" dot as the window/taskbar icon (no file, no extra dependency)
     icon = tk.PhotoImage(width=64, height=64)
@@ -720,6 +775,17 @@ def run_gui(args):
             if n in (auto_mic, auto_loop):
                 src_lb.selection_set(i)
 
+    # --- desktop audio via WASAPI loopback (no Stereo Mix / virtual cable) ---
+    has_sc = have_soundcard()
+    desk_var = tk.BooleanVar(value=bool(cfg.get("desktop_audio", False)) and has_sc)
+    desk_chk = ttk.Checkbutton(
+        root, variable=desk_var,
+        text=("Also record desktop audio - WASAPI loopback, no cable needed" if has_sc
+              else "Desktop audio (no cable) - run: pip install soundcard"))
+    if not has_sc:
+        desk_chk.config(state="disabled")
+    desk_chk.pack(anchor="w", padx=10, pady=(4, 0))
+
     # --- threshold ---
     thr = tk.DoubleVar(value=cfg.get("threshold", args.threshold))
     ttk.Label(root, text="Mic trigger threshold (0-1)").pack(anchor="w", padx=10, pady=(8, 0))
@@ -784,6 +850,8 @@ def run_gui(args):
         pre_spin.config(state=st)
         post_spin.config(state=st)
         buf_entry.config(state=st)
+        if has_sc:
+            desk_chk.config(state=st)      # leave disabled if soundcard is missing
         if not locked:
             _sync_buf_entry()              # folder stays disabled in RAM mode
 
@@ -839,7 +907,7 @@ def run_gui(args):
                        "pre": _window()[0], "post": _window()[1],
                        "bufdir": buf_var.get().strip() or BUFDIR,
                        "buffer_mode": _buffer_mode(), "encoder": _encoder(),
-                       "stats": stats_var.get()})
+                       "desktop_audio": desk_var.get(), "stats": stats_var.get()})
 
     def start():
         if clipper["obj"]:
@@ -850,7 +918,8 @@ def run_gui(args):
                     on_event=log, clipdir=folder.get(), test_mode=test_var.get(),
                     region=_selected_region(), pre=pre, post=post,
                     scale_h=_scale_h(), bufdir=buf_var.get().strip() or BUFDIR,
-                    buffer_mode=_buffer_mode(), encoder=_encoder())
+                    buffer_mode=_buffer_mode(), encoder=_encoder(),
+                    desktop_audio=desk_var.get())
         if c.start():
             clipper["obj"] = c
             _save_cfg()

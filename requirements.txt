@@ -1,2 +1,3 @@
 sounddevice
 numpy
+soundcard   # optional: "Record desktop audio" (WASAPI loopback, no virtual cable)

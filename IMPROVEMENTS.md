@@ -165,6 +165,21 @@ playback parity of the assembled fMP4 (start-PTS, A/V sync across players) can o
 be confirmed on a real run with real ffmpeg — verify a saved clip plays in your
 player of choice.
 
+### ✅ DONE: desktop audio without a virtual cable (WASAPI loopback)
+ffmpeg/dshow can't tap Windows output directly — hence the old Stereo Mix / VB-Cable
+requirement. Added an optional `soundcard` dependency: [capture_loopback](app.py)
+records the default speaker's **WASAPI loopback** (native per-endpoint loopback,
+no cable) and pumps float32 PCM into ffmpeg's **stdin** (`-f f32le -i pipe:0`),
+mixed via `amix` alongside any dshow sources. Gated behind a GUI checkbox, off by
+default; if `soundcard` isn't installed the checkbox is disabled with a hint.
+`build_ffmpeg_cmd(desktop_audio=True)` adds the stdin input and remaps audio.
+
+**Caveat (needs a real run):** the loopback capture + stdin PCM piping can't be
+verified here (no audio/ffmpeg). Confirm desktop audio actually lands in a clip and
+is in sync. When desktop audio is on, stdin carries PCM so ffmpeg can't be stopped
+with `q` — stop closes stdin and terminates (clean in RAM mode; disk mode may drop
+the final partial segment).
+
 ### ✅ DONE: GPU hardware encoder option
 Video-encoder dropdown — CPU (`libx264`) or GPU (`h264_amf` / `h264_nvenc` /
 `h264_qsv`), via [_venc_args](app.py). Offloads encoding from the CPU like ReLive;

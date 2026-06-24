@@ -131,6 +131,19 @@ def test_build_ffmpeg_ram_and_encoder():
     assert "h264_nvenc" in " ".join(build_ffmpeg_cmd([], encoder="h264_nvenc"))
 
 
+def test_build_ffmpeg_desktop_audio():
+    # desktop audio only (no dshow): loopback PCM on stdin is the single audio map
+    j = " ".join(build_ffmpeg_cmd([], desktop_audio=True))
+    assert "-i pipe:0" in j and "f32le" in j
+    assert "amix" not in j and "-map 1:a" in j        # pcm is input index 1
+    # one dshow + desktop audio -> two sources mixed
+    j2 = " ".join(build_ffmpeg_cmd(["MicA"], desktop_audio=True))
+    assert "amix=inputs=2" in j2 and "[1:a][2:a]" in j2
+    assert "audio=MicA" in j2 and "-i pipe:0" in j2
+    # off by default: no stdin audio input
+    assert "pipe:0" not in " ".join(build_ffmpeg_cmd(["MicA"]))
+
+
 def _box(btype, payload=b""):
     return struct.pack(">I", 8 + len(payload)) + btype.encode("latin1") + payload
 
@@ -198,6 +211,7 @@ if __name__ == "__main__":
     test_build_ffmpeg_cmd()
     test_build_ffmpeg_scale()
     test_build_ffmpeg_ram_and_encoder()
+    test_build_ffmpeg_desktop_audio()
     test_iter_mp4_boxes()
     test_rambuffer_feed_and_slice()
     test_estimate_footprint()
