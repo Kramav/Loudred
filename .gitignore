@@ -6,5 +6,7 @@ env/
 *.egg-info/
 .pytest_cache/
 buffer/
+clips/
+loudred_settings.json
 .claude/
 .env

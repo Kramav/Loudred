@@ -59,6 +59,42 @@ Capture only a specific app's audio (e.g. just Discord, not the whole desktop).
 - This is the most involved item; the Voicemeeter-routing workaround gives
   ~80% of the value for ~0 effort and may be enough.
 
+## Pain points found in code scan (bugs, not features)
+
+Ordered by how much they hurt. **#1, #2, #3, #5, #6, #7 are now fixed**; #4 is a
+design trade-off left open (see below).
+
+1. **ffmpeg-missing crashes at startup.**  ✅ DONE — [main](app.py) checks
+   `shutil.which("ffmpeg")` and shows a friendly messagebox (or prints, if Tk is
+   unavailable) instead of a traceback; [list_dshow_audio](app.py#L62) also
+   swallows `FileNotFoundError`.
+
+2. **ffmpeg failures are invisible.**  ✅ DONE — recorder stderr now goes to
+   `buffer/ffmpeg.log` and a `_watch_proc` thread reports "Recorder stopped
+   unexpectedly (exit N)" and flips state to `error` (red meter) when ffmpeg
+   dies on its own.
+
+3. **Trigger fires on single-sample clicks.**  ✅ DONE — `peak_level` replaced by
+   [rms_level](app.py) (RMS of the block). Default `--threshold` dropped to 0.1
+   to match the new scale. A single 0.9 click now reads <0.05.
+
+4. **Back-to-back moments are dropped.** [_do_clip](app.py) holds `_armed=False`
+   for `POST+1`s plus a 1s cooldown (~17s); any second peak in that window is
+   lost. Left as-is: it's inherent to fixed-window non-overlapping clips, and
+   merging/extending the in-flight clip is a real feature, not a one-liner.
+   Revisit if missed back-to-back moments actually bite.
+
+5. **stop() freezes the UI.**  ✅ DONE — the Stop button runs teardown on a
+   worker thread and re-enables controls via `root.after`; window-close stays
+   synchronous (we're quitting anyway).
+
+6. **No settings persistence.**  ✅ DONE — monitor/mic/sources/threshold/folder
+   save to `loudred_settings.json` (next to `app.py`) on start and on close, and
+   reload on launch.
+
+7. **Stale `concat_*.txt` on crash.**  ✅ DONE — [prune_loop](app.py) now also
+   sweeps `concat_*.txt` older than `RETENTION`.
+
 ## Smaller fixes worth doing alongside
 - **Trigger/segment clock alignment**: trigger time is `time.time()`; segment
   names are wall-clock — verify the peak lands ~15s in, adjust offset if not

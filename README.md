@@ -35,8 +35,11 @@ python app.py
   **red / "WOULD CLIP"** when the level crosses the threshold (white marker line),
   green / "armed" otherwise.
 - Tick **Test mode** to watch levels without ever saving a clip.
-- Click **Start**. When your mic peaks above the threshold, a clip is written to
-  the clips folder. **Change…** moves that folder; **Open clips folder** opens it.
+- Click **Start**. When your mic gets loud above the threshold, a clip is written
+  to the clips folder. **Change…** moves that folder; **Open clips folder** opens it.
+
+Your monitor / mic / sources / threshold / folder are remembered between runs
+(in `loudred_settings.json` next to `app.py`).
 
 List detected audio devices:
 
@@ -53,7 +56,9 @@ python app.py --mic "Microphone (Realtek)" --loopback "Stereo Mix (Realtek)"
 ## Tuning
 
 If it triggers too easily, raise the threshold; if it never fires, lower it —
-use the live meter to see where your normal vs. loud level sits.
+use the live meter to see where your normal vs. loud level sits. The level is
+**RMS loudness**, not raw peaks, so brief clicks/pops won't trip it (default
+threshold `0.1`).
 
 Other knobs live at the top of `app.py`: `PRE`, `POST` (clip window), `FPS`,
 `SEG_LEN`, `RETENTION` (buffer length).

@@ -9,7 +9,9 @@ Needs ffmpeg on PATH. See README.md.
 import argparse
 import ctypes
 import glob
+import json
 import os
+import shutil
 import subprocess
 import threading
 import time
@@ -30,15 +32,40 @@ SEG_GLOB = "seg_*.ts"
 SEG_FMT = "seg_%Y%m%d_%H%M%S.ts"
 LOOPBACK_HINTS = ("stereo mix", "cable output", "loopback", "what u hear",
                   "what you hear", "voicemeeter out b1")
+SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "loudred_settings.json")
 
 
 # ---- pure logic (covered by test_app.py) ----
 
-def peak_level(block):
-    """Max absolute sample of a float32 block, 0..1."""
+def rms_level(block):
+    """RMS loudness of a float32 block, 0..1.
+
+    RMS, not peak: a single stray sample (a click/pop) gets averaged away, so
+    only sustained loudness trips the trigger.
+    ponytail: per-callback RMS, no smoothing. Add a moving average across blocks
+    only if one noisy block still false-fires.
+    """
     if len(block) == 0:
         return 0.0
-    return float(np.abs(block).max())
+    return float(np.sqrt(np.mean(np.square(block, dtype=np.float64))))
+
+
+def load_settings():
+    """GUI choices from last run (or {} if missing/unreadable)."""
+    try:
+        with open(SETTINGS_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(d):
+    try:
+        with open(SETTINGS_FILE, "w") as f:
+            json.dump(d, f, indent=2)
+    except OSError:
+        pass
 
 
 def parse_seg_time(name):
@@ -61,10 +88,13 @@ def select_segments(segs, trigger, pre=PRE, post=POST, seg_len=SEG_LEN):
 
 def list_dshow_audio():
     """Names of DirectShow audio devices via ffmpeg (parsed from stderr)."""
-    out = subprocess.run(
-        ["ffmpeg", "-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
-        capture_output=True, text=True,
-    ).stderr
+    try:
+        out = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
+            capture_output=True, text=True,
+        ).stderr
+    except FileNotFoundError:
+        return []          # ffmpeg not installed; main() shows a friendly error
     # ffmpeg tags each device line "(audio)"/"(video)"; skip "Alternative name" lines.
     names = []
     for line in out.splitlines():
@@ -155,7 +185,7 @@ def build_ffmpeg_cmd(audio_devices, region=None):
 
 
 def prune_loop(stop):
-    """Delete buffer segments older than RETENTION seconds."""
+    """Delete buffer segments (and stale concat lists) older than RETENTION."""
     while not stop.is_set():
         cutoff = time.time() - RETENTION
         for f in glob.glob(os.path.join(BUFDIR, SEG_GLOB)):
@@ -163,6 +193,14 @@ def prune_loop(stop):
                 if parse_seg_time(f) < cutoff:
                     os.remove(f)
             except (ValueError, OSError):
+                pass
+        # concat_*.txt lives <POST+1s during a clip; anything older is orphaned
+        # by a crash between write and remove in build_clip.
+        for f in glob.glob(os.path.join(BUFDIR, "concat_*.txt")):
+            try:
+                if os.path.getmtime(f) < cutoff:
+                    os.remove(f)
+            except OSError:
                 pass
         stop.wait(5)
 
@@ -215,8 +253,9 @@ class Clipper:
         self.test_mode = test_mode
         self.level = 0.0           # latest mic peak, for the GUI meter
         self.clip_count = 0
-        self.state = "idle"        # idle | armed | capturing | cooldown
+        self.state = "idle"        # idle | armed | capturing | cooldown | error
         self._proc = None
+        self._errlog = None
         self._stop = threading.Event()
         self._stream = None
         self._armed = True
@@ -242,17 +281,31 @@ class Clipper:
         except Exception as e:
             self.on_event("Trigger mic failed to open: %s" % e)
             return False
+        self._errlog = open(os.path.join(BUFDIR, "ffmpeg.log"), "w")
         self._proc = subprocess.Popen(build_ffmpeg_cmd(self.audio_devices, self.region),
                                       stdin=subprocess.PIPE,
-                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                      stdout=subprocess.DEVNULL, stderr=self._errlog)
         threading.Thread(target=prune_loop, args=(self._stop,), daemon=True).start()
+        threading.Thread(target=self._watch_proc, daemon=True).start()
         self.state = "armed"
         self.on_event("Recording. Buffering %ds; clips = %ds before + %ds after a peak.%s"
                       % (RETENTION, PRE, POST, "  [TEST MODE - no clips]" if self.test_mode else ""))
         return True
 
+    def _watch_proc(self):
+        """If ffmpeg dies on its own (bad device, dshow error), say so loudly
+        instead of pretending we're still recording."""
+        proc = self._proc
+        if not proc:
+            return
+        code = proc.wait()
+        if not self._stop.is_set():
+            self.state = "error"
+            self.on_event("Recorder (ffmpeg) stopped unexpectedly (exit %s). See %s"
+                          % (code, os.path.join(BUFDIR, "ffmpeg.log")))
+
     def _on_audio(self, indata, frames, t, status):
-        lvl = peak_level(indata[:, 0])
+        lvl = rms_level(indata[:, 0])
         self.level = lvl
         if self.test_mode:
             return
@@ -288,6 +341,8 @@ class Clipper:
             except Exception:
                 self._proc.terminate()
             self._proc = None
+        if self._errlog:
+            self._errlog.close(); self._errlog = None
         self.state = "idle"
         self.level = 0.0
         self.on_event("Stopped.")
@@ -316,8 +371,9 @@ def run_gui(args):
     root._icon = icon            # keep a reference so it isn't garbage-collected
     root.iconphoto(True, icon)
 
+    cfg = load_settings()
     status = tk.StringVar(value="Idle. Pick devices, set threshold, then Start.")
-    folder = tk.StringVar(value=os.path.abspath(CLIPDIR))
+    folder = tk.StringVar(value=cfg.get("folder", os.path.abspath(CLIPDIR)))
     test_var = tk.BooleanVar(value=False)
     clipper = {"obj": None}
 
@@ -337,7 +393,9 @@ def run_gui(args):
             default_mon = i + 1            # default to the primary monitor
     ttk.Label(root, text="Record video from (screen capture, H.264):").pack(anchor="w", padx=10, pady=(10, 0))
     mon_cb = ttk.Combobox(root, state="readonly", values=mon_opts)
-    mon_cb.current(default_mon if mon_opts else 0)
+    saved_mon = cfg.get("monitor", default_mon)
+    mon_cb.current(saved_mon if 0 <= saved_mon < len(mon_opts)
+                   else (default_mon if mon_opts else 0))
     mon_cb.pack(fill="x", padx=10)
 
     # --- trigger mic (sounddevice) ---
@@ -346,6 +404,8 @@ def run_gui(args):
     mic_cb = ttk.Combobox(root, state="readonly",
                           values=[name for _, name in mics] or ["(no input devices)"])
     mic_cb.current(0)
+    if cfg.get("mic") in mic_cb["values"]:
+        mic_cb.set(cfg["mic"])
     mic_cb.pack(fill="x", padx=10)
 
     # --- recorded audio sources (dshow, multi-select) ---
@@ -357,14 +417,20 @@ def run_gui(args):
     for n in dshow:
         src_lb.insert(tk.END, n)
     src_lb.pack(fill="x", padx=10)
-    # preselect the auto-detected mic + loopback
-    auto_mic, auto_loop = pick_devices(args.mic, args.loopback)
-    for i, n in enumerate(dshow):
-        if n in (auto_mic, auto_loop):
-            src_lb.selection_set(i)
+    # preselect last run's sources, else the auto-detected mic + loopback
+    saved_sources = cfg.get("sources")
+    if saved_sources:
+        for i, n in enumerate(dshow):
+            if n in saved_sources:
+                src_lb.selection_set(i)
+    else:
+        auto_mic, auto_loop = pick_devices(args.mic, args.loopback)
+        for i, n in enumerate(dshow):
+            if n in (auto_mic, auto_loop):
+                src_lb.selection_set(i)
 
     # --- threshold ---
-    thr = tk.DoubleVar(value=args.threshold)
+    thr = tk.DoubleVar(value=cfg.get("threshold", args.threshold))
     ttk.Label(root, text="Mic trigger threshold (0-1)").pack(anchor="w", padx=10, pady=(8, 0))
     ttk.Scale(root, from_=0.0, to=1.0, variable=thr,
               command=lambda v: _set_thr()).pack(fill="x", padx=10)
@@ -419,6 +485,11 @@ def run_gui(args):
             return None                    # all monitors
         return monitors[i - 1][:4]         # (x, y, w, h)
 
+    def _save_cfg():
+        save_settings({"monitor": mon_cb.current(), "mic": mic_cb.get(),
+                       "sources": _selected_sources(), "threshold": thr.get(),
+                       "folder": folder.get()})
+
     def start():
         if clipper["obj"]:
             return
@@ -428,14 +499,22 @@ def run_gui(args):
                     region=_selected_region())
         if c.start():
             clipper["obj"] = c
+            _save_cfg()
             start_btn.config(state="disabled"); stop_btn.config(state="normal")
             _lock_inputs(True)
 
     def stop():
-        if clipper["obj"]:
-            clipper["obj"].stop(); clipper["obj"] = None
-        start_btn.config(state="normal"); stop_btn.config(state="disabled")
-        _lock_inputs(False)
+        c = clipper["obj"]
+        if not c:
+            return
+        clipper["obj"] = None
+        stop_btn.config(state="disabled")
+        # ponytail: teardown waits up to 5s for ffmpeg to finalize; do it off the
+        # UI thread so the window doesn't freeze, then re-enable controls.
+        def worker():
+            c.stop()
+            root.after(0, lambda: (start_btn.config(state="normal"), _lock_inputs(False)))
+        threading.Thread(target=worker, daemon=True).start()
 
     def open_folder():
         os.makedirs(folder.get(), exist_ok=True)
@@ -465,7 +544,9 @@ def run_gui(args):
         c = clipper["obj"]
         if c:
             lvl = c.level
-            if c.test_mode:
+            if c.state == "error":
+                label, color = "RECORDER DIED - see buffer/ffmpeg.log", "#c0392b"
+            elif c.test_mode:
                 label, color = "TEST - no clips", "#3498db"
             elif c.state == "capturing":
                 label, color = "CAPTURING...", "#e67e22"
@@ -483,18 +564,41 @@ def run_gui(args):
         root.after(100, tick)
     tick()
 
-    root.protocol("WM_DELETE_WINDOW", lambda: (stop(), root.destroy()))
+    def on_close():
+        try:
+            _save_cfg()
+        except Exception:
+            pass
+        c = clipper["obj"]
+        if c:
+            clipper["obj"] = None
+            c.stop()                       # synchronous: we're quitting, finalize cleanly
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
     root.mainloop()
 
 
 def main():
     set_dpi_aware()   # must run before enumerating monitors / building the GUI
     p = argparse.ArgumentParser(description="Peak-triggered screen+audio clipper")
-    p.add_argument("--threshold", type=float, default=0.3, help="mic peak 0..1 to trigger a clip")
+    p.add_argument("--threshold", type=float, default=0.1, help="mic RMS loudness 0..1 to trigger a clip")
     p.add_argument("--mic", help="override DirectShow mic device name")
     p.add_argument("--loopback", help="override DirectShow loopback device name")
     p.add_argument("--list-devices", action="store_true", help="list dshow audio devices and exit")
     args = p.parse_args()
+    if not shutil.which("ffmpeg"):
+        msg = ("ffmpeg was not found on your PATH. Install it so that "
+               "`ffmpeg -version` works in a terminal, then retry (see README).")
+        try:
+            import tkinter as tk
+            from tkinter import messagebox
+            r = tk.Tk(); r.withdraw()
+            messagebox.showerror("Loudred - ffmpeg missing", msg)
+            r.destroy()
+        except Exception:
+            print(msg)
+        return
     if args.list_devices:
         for n in list_dshow_audio():
             print(n)
